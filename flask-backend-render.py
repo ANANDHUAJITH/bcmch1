@@ -56,7 +56,7 @@ def detect_obstructive(t, sig, fs, amp_thresh=0.05, zero_cross_thresh=2, win=8):
             mask[i:i + w] = True
     return events, mask
 
-def detect_breaths(t, sig, fs, mask, min_interval=2.5, prom=0.001, min_amp=0.001):
+def detect_breaths(t, sig, fs, mask, min_interval=3, prom=0.01, min_amp=0.001):
     min_distance = int(fs * min_interval)
     peaks, _ = find_peaks(sig, distance=min_distance, prominence=prom)
     valid_peaks = []
@@ -87,7 +87,7 @@ def detect_breaths(t, sig, fs, mask, min_interval=2.5, prom=0.001, min_amp=0.001
 
     return filtered_peaks
 
-def detect_central(t, sig, peaks, fs, win=10.0, amp_thr=0.004, uniformity_thr=0.2):
+def detect_central(t, sig, peaks, fs, win=8.0, amp_thr=0.004, uniformity_thr=0.2):
     events = []
     sig_demean = sig - np.mean(sig)
 
