@@ -1,97 +1,229 @@
-from flask import Flask, request, jsonify
-import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt, find_peaks
-from werkzeug.utils import secure_filename
 import os
+import io
+import base64
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from flask import Flask, request, jsonify, send_from_directory
+from scipy.signal import butter, filtfilt, find_peaks
+from flask_cors import CORS
 
 app = Flask(__name__)
-UPLOAD_FOLDER = 'uploads'
+CORS(app)
+
+UPLOAD_FOLDER = os.environ.get('UPLOAD_FOLDER', 'uploads')
+ANALYSIS_FOLDER = os.environ.get('ANALYSIS_FOLDER', 'analysis_results')
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
+os.makedirs(ANALYSIS_FOLDER, exist_ok=True)
+
+FS = 25.0
+AMPLIFICATION = 2.0
 
 def butter_bandpass(lowcut, highcut, fs, order=4):
     nyq = 0.5 * fs
-    low = lowcut / nyq
-    high = highcut / nyq
-    return butter(order, [low, high], btype='band')
+    return butter(order, [lowcut / nyq, highcut / nyq], btype='band')
 
-def bandpass_filter(data, lowcut, highcut, fs, order=4):
-    b, a = butter_bandpass(lowcut, highcut, fs, order=order)
-    return filtfilt(b, a, data)
+def butter_lowpass(cutoff, fs, order=4):
+    nyq = 0.5 * fs
+    return butter(order, cutoff / nyq, btype='low')
 
-def detect_breaths(sig, fs, prom=0.005):
-    peaks, _ = find_peaks(sig, distance=int(fs * 0.5), prominence=prom)
-    return peaks
+def apply_breathing_filter(signal):
+    b, a = butter_bandpass(0.1, 0.4, FS)
+    return filtfilt(b, a, signal)
 
-def detect_central_apnea(t, sig, peaks, fs, win=8, amp_thr=0.03):
+def apply_central_filter(signal):
+    b, a = butter_lowpass(0.1, FS)
+    return filtfilt(b, a, signal)
+
+def detect_obstructive(t, sig, fs, amp_thresh=0.05, zero_cross_thresh=2, win=8):
+    mask = np.zeros(len(sig), dtype=bool)
+    events = []
+    w = int(fs * win)
+    sig_demean = sig - np.mean(sig)
+
+    for i in range(0, len(sig) - w, int(fs)):
+        seg = sig_demean[i:i + w]
+        amp = np.mean(np.abs(seg))
+        zero_crossings = np.where(np.diff(np.sign(seg)))[0]
+        zero_count = len(zero_crossings)
+
+        if amp > amp_thresh and zero_count > zero_cross_thresh:
+            events.append((t[i], t[i + w]))
+            mask[i:i + w] = True
+    return events, mask
+
+def detect_breaths(t, sig, fs, mask, min_interval=2, prom=0.005, min_amp=0.0005):
+    min_distance = int(fs * min_interval)
+    peaks, _ = find_peaks(sig, distance=min_distance, prominence=prom)
+    valid_peaks = []
+
+    for i, p in enumerate(peaks):
+        if mask[p]:
+            continue
+        amp = sig[p]
+        if abs(amp) < min_amp:
+            continue
+        prev_amp = sig[p - 1] if p > 0 else amp
+        next_amp = sig[p + 1] if p < len(sig) - 1 else amp
+        if amp > max(prev_amp, next_amp) * 0.2:
+            valid_peaks.append(p)
+
+    filtered_peaks = []
+    for i, p in enumerate(valid_peaks):
+        if i == 0 or i == len(valid_peaks) - 1:
+            filtered_peaks.append(p)
+        else:
+            prev_t = t[valid_peaks[i - 1]]
+            curr_t = t[p]
+            next_t = t[valid_peaks[i + 1]]
+            interval_prev = curr_t - prev_t
+            interval_next = next_t - curr_t
+            if 2.5 <= interval_prev <= 6.0 or 2.5 <= interval_next <= 6.0:
+                filtered_peaks.append(p)
+
+    return filtered_peaks
+
+def detect_central(t, sig, peaks, fs, win=6.0, amp_thr=0.008, uniformity_thr=0.2):
     events = []
     sig_demean = sig - np.mean(sig)
+
     for i in range(1, len(peaks)):
         s, e = peaks[i - 1], peaks[i]
         seg = sig_demean[s:e]
         duration = t[e] - t[s]
-        amplitude = np.mean(np.abs(seg))
-        if duration >= win and amplitude < amp_thr:
-            events.append((t[s], t[e]))
+
+        if duration < win:
+            continue
+
+        amp = np.mean(np.abs(seg))
+        if amp > amp_thr:
+            continue
+
+        seg_peaks, _ = find_peaks(seg, prominence=0.0005, distance=int(fs * 1.5))
+        seg_times = t[s:e][seg_peaks]
+
+        if len(seg_times) >= 3:
+            intervals = np.diff(seg_times)
+            mean_ivl = np.mean(intervals)
+            std_ivl = np.std(intervals)
+            if std_ivl > uniformity_thr * mean_ivl:
+                continue
+
+        events.append((t[s], t[e]))
+
     return events
 
-@app.route('/upload', methods=['POST'])
-def upload_file():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+def merge_events(events, gap=2):
+    if not events:
+        return []
+    merged = [events[0]]
+    for s, e in events[1:]:
+        if s - merged[-1][1] <= gap:
+            merged[-1] = (merged[-1][0], max(e, merged[-1][1]))
+        else:
+            merged.append((s, e))
+    return merged
 
-    file = request.files['file']
-    filename = secure_filename(file.filename)
-    filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-    file.save(filepath)
+@app.route('/', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'message': 'Sleep Apnea Detection API is running', 'version': '1.0.0'})
 
+@app.route('/analyze', methods=['POST'])
+def analyze():
     try:
-        data = np.genfromtxt(filepath, delimiter=',', skip_header=1)
-        t = data[:, 0]
-        z = data[:, 1]
+        if 'file' not in request.files:
+            return jsonify({'error': 'No file uploaded'}), 400
 
-        fs = 20  # Sampling rate
-        z_filtered = bandpass_filter(z, 0.1, 0.8, fs)
-        z_demean = z_filtered - np.mean(z_filtered)
+        file = request.files['file']
+        filename = file.filename
+        if not filename or not filename.endswith('.csv'):
+            return jsonify({'error': 'File must be a CSV'}), 400
 
-        peaks = detect_breaths(z_demean, fs)
-        cen_events = detect_central_apnea(t, z_demean, peaks, fs)
+        filepath = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(filepath)
 
-        # Merge nearby events
-        cen_merged = []
-        if cen_events:
-            start, end = cen_events[0]
-            for s, e in cen_events[1:]:
-                if s - end < 5:
-                    end = e
-                else:
-                    cen_merged.append((start, end))
-                    start, end = s, e
-            cen_merged.append((start, end))
+        try:
+            df = pd.read_csv(filepath)
+            if len(df.columns) == 1:
+                df = pd.read_csv(filepath, sep='\t')
+            if 'Time' not in df.columns or 'Z_g' not in df.columns:
+                return jsonify({'error': f'Missing Time or Z_g columns. Found: {df.columns.tolist()}'}), 400
+        except Exception as e:
+            return jsonify({'error': f'Invalid CSV: {str(e)}'}), 400
 
-        # Plot for verification
-        plt.figure(figsize=(12, 4))
-        plt.plot(t, z_demean, label='Z Accel (Filtered)', color='black')
-        plt.plot(t[peaks], z_demean[peaks], 'x', label='Breaths', color='green')
+        t = df['Time'].values
+        raw = df['Z_g'].values * AMPLIFICATION
+
+        unamplified_breathing = apply_breathing_filter(raw)
+        breathing_signal = unamplified_breathing * 30
+        unamplified_central = apply_central_filter(raw)
+        obs_events, obs_mask = detect_obstructive(t, unamplified_breathing, FS)
+        peaks = detect_breaths(t, unamplified_breathing, FS, obs_mask)
+        cen_events = detect_central(t, unamplified_central, peaks, FS)
+
+        obs_merged = merge_events(obs_events)
+        cen_merged = merge_events(cen_events)
+
+        events = []
+        for s, e in obs_merged:
+            events.append({'start_time': s, 'end_time': e, 'event': 'Obstructive Apnea'})
         for s, e in cen_merged:
-            plt.axvspan(s, e, color='blue', alpha=0.2, label='Central Apnea')
-        plt.xlabel("Time (s)")
-        plt.ylabel("Z (g)")
-        plt.title("Central Apnea Detection")
-        plt.legend()
-        plt.savefig('static/apnea_plot.png')
+            events.append({'start_time': s, 'end_time': e, 'event': 'Central Apnea'})
+
+        events_df = pd.DataFrame(events)
+        events_filename = os.path.splitext(filename)[0] + '_events.csv'
+        events_path = os.path.join(ANALYSIS_FOLDER, events_filename)
+        events_df.to_csv(events_path, index=False)
+
+        plt.style.use('default')
+        plt.figure(figsize=(14, 8))
+        plt.axhline(y=0.15, color='red', linestyle='--', alpha=0.7, linewidth=1)
+        plt.plot(t, raw, label='Raw Z-axis', alpha=0.6, color='blue', linewidth=0.8)
+        plt.plot(t, breathing_signal, label='Breathing Signal (Filtered)', color='violet', linewidth=1.2)
+        plt.plot(t[peaks], breathing_signal[peaks], 'ro', label='Breath Peaks', markersize=4)
+
+        for i, (s, e) in enumerate(cen_merged):
+            plt.axvspan(s, e, color='blue', alpha=0.2, label='Central Apnea' if i == 0 else '')
+        for i, (s, e) in enumerate(obs_merged):
+            plt.axvspan(s, e, color='orange', alpha=0.3, label='Obstructive Apnea' if i == 0 else '')
+
+        plt.title("Sleep Apnea Detection Analysis", fontsize=16, fontweight='bold')
+        plt.xlabel("Time (seconds)", fontsize=12)
+        plt.ylabel("Z-axis Acceleration (g)", fontsize=12)
+        plt.legend(loc='upper right', fontsize=10)
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', dpi=100, bbox_inches='tight')
+        buf.seek(0)
+        plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        buf.close()
         plt.close()
 
-        response = {
-            'central_apnea_events': [{'start': round(s, 2), 'end': round(e, 2)} for s, e in cen_merged],
-            'total_events': len(cen_merged),
-            'plot_path': '/static/apnea_plot.png'
-        }
-        return jsonify(response)
+        os.remove(filepath)
+
+        return jsonify({
+            'events_file': events_filename,
+            'plot': plot_base64,
+            'breath_count': len(peaks),
+            'central_apnea_count': len(cen_merged),
+            'obstructive_apnea_count': len(obs_merged),
+            'total_duration': float(t[-1] - t[0]) if len(t) > 0 else 0,
+            'data_points': len(t)
+        })
 
     except Exception as e:
-        return jsonify({'error': str(e)}), 500
+        print(f"Analysis error: {str(e)}")
+        return jsonify({'error': f'Analysis failed: {str(e)}'}), 500
+
+@app.route('/download/<filename>', methods=['GET'])
+def download(filename):
+    try:
+        return send_from_directory(ANALYSIS_FOLDER, os.path.basename(filename))
+    except FileNotFoundError:
+        return jsonify({'error': 'File not found'}), 404
 
 if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port, debug=False)
