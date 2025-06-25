@@ -19,24 +19,22 @@ os.makedirs(ANALYSIS_FOLDER, exist_ok=True)
 FS = 25.0
 AMPLIFICATION = 2.0
 
-# --- FILTER ---
+# ---------- FILTER FUNCTIONS ----------
 def butter_bandpass(lowcut, highcut, fs, order=4):
     nyq = 0.5 * fs
     low = lowcut / nyq
     high = highcut / nyq
-    b, a = butter(order, [low, high], btype='band')
-    return b, a
+    return butter(order, [low, high], btype='band')
 
-def apply_bandpass_filter(signal, lowcut=0.1, highcut=2.0):
-    b, a = butter_bandpass(lowcut, highcut, FS)
+def apply_bandpass_filter(signal, lowcut=0.1, highcut=2.0, fs=25.0):
+    b, a = butter_bandpass(lowcut, highcut, fs)
     return filtfilt(b, a, signal)
 
-# --- BREATH DETECTION ---
+# ---------- DETECTION FUNCTIONS ----------
 def detect_breaths(sig, fs, prom=0.01):
     peaks, _ = find_peaks(sig, distance=int(fs * 0.5), prominence=prom)
     return peaks
 
-# --- CENTRAL APNEA DETECTION ---
 def detect_central_apnea(t, sig, peaks, fs, win=8, amp_thr=0.1):
     events = []
     for i in range(1, len(peaks)):
@@ -85,59 +83,59 @@ def analyze():
             df = pd.read_csv(filepath)
             if len(df.columns) == 1:
                 df = pd.read_csv(filepath, sep='\t')
-
             if 'Time' not in df.columns or 'Z_g' not in df.columns:
-                return jsonify({'error': f'Missing columns. Found: {df.columns.tolist()}'}), 400
-
+                available_cols = ', '.join(df.columns.tolist())
+                return jsonify({'error': f'CSV must contain Time and Z_g columns. Found columns: {available_cols}'}), 400
             if not np.issubdtype(df['Time'].dtype, np.number):
-                return jsonify({'error': 'Time column must be numeric'}), 400
-
+                return jsonify({'error': 'Time column must contain numeric values (seconds)'}), 400
         except Exception as e:
-            return jsonify({'error': f'Invalid CSV: {str(e)}'}), 400
+            return jsonify({'error': f'Invalid CSV file: {str(e)}'}), 400
 
         t = df['Time'].to_numpy()
-        z = df['Z_g'].to_numpy() * AMPLIFICATION
+        raw = df['Z_g'].to_numpy() * AMPLIFICATION
 
-        filtered = apply_bandpass_filter(z)
-        peaks = detect_breaths(filtered, FS)
-        cen_events = detect_central_apnea(t, filtered, peaks, FS)
+        filtered = apply_bandpass_filter(raw, fs=FS)
+        breath_peaks = detect_breaths(filtered, FS)
+        cen_events = detect_central_apnea(t, filtered, breath_peaks, FS)
         cen_merged = merge_events(cen_events)
 
-        events = [{'start_time': s, 'end_time': e, 'event': 'Central Apnea'} for s, e in cen_merged]
+        events = []
+        for s, e in cen_merged:
+            events.append({'start_time': s, 'end_time': e, 'event': 'Central Apnea'})
+
         events_df = pd.DataFrame(events)
         events_filename = os.path.splitext(filename)[0] + '_events.csv'
         events_path = os.path.join(ANALYSIS_FOLDER, events_filename)
         events_df.to_csv(events_path, index=False)
 
-        # --- PLOT ---
-        plt.figure(figsize=(14, 8))
-        plt.plot(t, z, label='Raw Z-axis', alpha=0.6)
+        plt.figure(figsize=(14, 6))
+        plt.plot(t, raw, label='Raw Z-axis', alpha=0.5)
         plt.plot(t, filtered, label='Filtered Signal', color='orange')
-        plt.plot(t[peaks], filtered[peaks], 'ro', label='Breath Peaks')
-
+        plt.plot(t[breath_peaks], filtered[breath_peaks], 'ro', label='Breath Peaks')
         for i, (s, e) in enumerate(cen_merged):
-            plt.axvspan(s, e, color='blue', alpha=0.2, label='Central Apnea' if i == 0 else "")
-
-        plt.title("Sleep Apnea Detection Analysis", fontsize=16)
+            plt.axvspan(s, e, color='blue', alpha=0.2, label='Central Apnea' if i == 0 else '')
+        plt.legend(loc='upper right')
         plt.xlabel("Time (s)")
         plt.ylabel("Z-axis Acceleration (g)")
-        plt.legend(loc='upper right')
-        plt.grid(True)
+        plt.title("Central Apnea Detection (Full Signal)")
         plt.tight_layout()
 
         buf = io.BytesIO()
-        plt.savefig(buf, format='png', dpi=100)
+        plt.savefig(buf, format='png')
         buf.seek(0)
-        plot_base64 = base64.b64encode(buf.read()).decode('utf-8')
+        plot_b64 = base64.b64encode(buf.read()).decode('utf-8')
         buf.close()
         plt.close()
 
-        os.remove(filepath)
+        try:
+            os.remove(filepath)
+        except:
+            pass
 
         return jsonify({
             'events_file': events_filename,
-            'plot': plot_base64,
-            'breath_count': len(peaks),
+            'plot': plot_b64,
+            'breath_count': len(breath_peaks),
             'central_apnea_count': len(cen_merged),
             'obstructive_apnea_count': 0,
             'total_duration': float(t[-1] - t[0]) if len(t) > 0 else 0,
